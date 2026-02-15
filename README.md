@@ -38,8 +38,8 @@ Orders flow through validation and notification stages, with automatic email not
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
 │                              Apache Kafka Cluster (3 Brokers)                           │
 │                                                                                         │
-│   Topics: order-placed ──▶ order-confirmed ──▶ Email (confirmed)                        │
-│           order-placed ──▶ order-failed ──▶ Email (failed)                              │
+│   Topics: order-placed ──▶ order-confirmed ──▶ Email (confirmed)                       │
+│           order-placed ──▶ order-failed ──▶ Email (failed)                             │
 │           order-placed-retry-0/1/2, order-placed-dlt (DLT for failed messages)          │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
