@@ -14,6 +14,7 @@
 - [Technology Stack](#technology-stack)
 - [Project Structure](#project-structure)
 - [Prerequisites](#prerequisites)
+- [Getting Started](#getting-started)
 - [API Reference](#api-reference)
 - [Kafka Topics](#kafka-topics)
 - [Configuration](#configuration)
@@ -56,7 +57,7 @@ Orders flow through validation and notification stages, with automatic email not
 - **Dead Letter Topic (DLT)** - Failed messages automatically routed to DLT for inspection
 - **Transactional Emails** - Order confirmation and failure notifications via Mailgun
 - **Audit Headers** - Correlation ID, timestamp, and source headers added via `ProducerInterceptor`
-- **Consumer Metrics** - Message count, bytes consumed, and commit tracking via `ConsumerInterceptor`
+- **Consumer Metrics** - Message count, bytes consumed, and commit tracking via `ConsumerInterceptor` (order-validation)
 - **Manual Acknowledgment** - Reliable message processing with explicit acknowledgment
 
 ## Technology Stack
@@ -67,7 +68,7 @@ Orders flow through validation and notification stages, with automatic email not
 | Framework | Spring Boot 3.5.10 |
 | Messaging | Apache Kafka 4.1.1, Spring Kafka |
 | Build Tool | Maven 3.6+ |
-| Email Service | Mailgun API |
+| Email Service | Mailgun API, Mailgun SDK 2.3 |
 | Template Engine | Thymeleaf |
 | Utilities | Hutool 5.8.43 |
 | Boilerplate | Lombok |
@@ -79,8 +80,10 @@ kafka-order-system/
 ├── order-common/                 # Shared DTOs, events, constants
 │   └── src/main/java/io/clementleetimfu/ordercommon/
 │       ├── constants/            # TopicConstants, RegionConstants, StatusConstants
-│       ├── dto/                  # OrderRequestDTO, OrderResponseDTO
+│       │                         # GroupConstants, HeaderConstants, EmailConstants, OrderConstants
+│       ├── dto/                  # OrderRequestDTO, OrderResponseDTO, OrderItemRequestDTO
 │       └── event/                # OrderPlacedEvent, OrderConfirmedEvent, OrderFailedEvent
+│                                 # OrderItem, OrderValidationResult
 │
 ├── order-api/                    # REST API service (Port 8080)
 │   └── src/main/java/io/clementleetimfu/orderapi/
@@ -98,10 +101,13 @@ kafka-order-system/
 │       └── interceptor/          # MetricsConsumerInterceptor
 │
 ├── order-notification/           # Email notification service (Port 8082)
-│   └── src/main/java/io/clementleetimfu/orderenotification/
-│       ├── config/               # KafkaConsumerConfig, MailgunConfig, MailgunProperties
-│       ├── consumer/             # OrderNotificationConsumer
-│       └── service/              # MailgunService, MailgunServiceImpl
+│   └── src/main/
+│       ├── java/io/clementleetimfu/orderenotification/
+│       │   ├── config/               # KafkaConsumerConfig, MailgunConfig, MailgunProperties
+│       │   ├── consumer/             # OrderNotificationConsumer
+│       │   └── service/              # MailgunService, impl/MailgunServiceImpl
+│       └── resources/
+│           └── templates/email/      # order-confirmed.html, order-failed.html
 │
 └── docker/                       # Docker Compose for Kafka cluster
     └── docker-compose.yml
@@ -113,6 +119,24 @@ kafka-order-system/
 - **Maven 3.6+** - Build and dependency management
 - **Apache Kafka Cluster** - 3-broker cluster (or use provided Docker Compose)
 - **Mailgun Account** - API key and domain for email sending
+
+## Getting Started
+
+### Build
+
+```bash
+mvn clean compile                           # Compile all modules
+cd order-common && mvn clean install -DskipTests  # Install common module first
+mvn clean package -DskipTests               # Create jars without tests
+```
+
+### Run Services Locally
+
+```bash
+cd order-api && mvn spring-boot:run         # API on port 8080
+cd order-validation && mvn spring-boot:run  # Validation on port 8081
+cd order-notification && mvn spring-boot:run  # Notification on port 8082
+```
 
 ## API Reference
 
@@ -187,21 +211,25 @@ kafka-order-system/
 | `order-confirmed` | 3 | order-validation | order-notification | Successfully validated orders |
 | `order-failed` | 3 | order-validation | order-notification | Orders that failed validation |
 
-### Retry Topics (Auto-created)
+### Retry Topics (Auto-created by @RetryableTopic)
 
 | Topic | Delay | Purpose |
 |-------|-------|---------|
 | `order-placed-retry-0` | 2s | First retry attempt |
 | `order-placed-retry-1` | 4s | Second retry attempt |
 | `order-placed-retry-2` | 8s | Third retry attempt |
+| `order-confirmed-retry-0/1/2` | 2s→4s→8s | Notification retries |
+| `order-failed-retry-0/1/2` | 2s→4s→8s | Notification retries |
 
-### Dead Letter Topics
+All retry topics use exponential backoff: 2s → 4s → 8s (max 16s), with 4 total attempts (1 original + 3 retries).
+
+### Dead Letter Topics (Auto-created by @RetryableTopic)
 
 | Topic | Purpose |
 |-------|---------|
-| `order-placed-dlt` | Messages that failed after all retries |
-| `order-confirmed-dlt` | Failed notification messages |
-| `order-failed-dlt` | Failed notification messages |
+| `order-placed-dlt` | Validation messages that failed after all retries |
+| `order-confirmed-dlt` | Notification messages that failed after all retries |
+| `order-failed-dlt` | Notification messages that failed after all retries |
 
 ### Region Partitioning
 
@@ -210,6 +238,13 @@ kafka-order-system/
 | `ASIA` | 0 | Asia-Pacific customers |
 | `EUROPE` | 1 | European customers |
 | `AMERICA` | 2 | Americas customers |
+
+### Consumer Groups
+
+| Group ID | Service | Purpose |
+|----------|---------|---------|
+| `order-validation-group` | order-validation | Consumes from `order-placed` |
+| `order-email-group` | order-notification | Consumes from `order-confirmed`, `order-failed` |
 
 ## Configuration
 
@@ -227,11 +262,14 @@ Each service has its own `application.yml`:
 | Service | Property | Default Value |
 |---------|----------|---------------|
 | order-api | `server.port` | 8080 |
+| order-api | `spring.application.name` | order-api |
 | order-validation | `server.port` | 8081 |
+| order-validation | `spring.application.name` | order-validation |
 | order-notification | `server.port` | 8082 |
+| order-notification | `spring.application.name` | order-notification-service |
 | All | `spring.kafka.bootstrap-servers` | 192.168.100.131:9092,9093,9094 |
 | order-notification | `mailgun.from` | noreply@kafka-order-system.com |
 
 ## License
 
-This project is licensed under the MIT License.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
