@@ -221,7 +221,7 @@ cd order-notification && mvn spring-boot:run  # Notification on port 8082
 | `order-confirmed-retry-0/1/2` | 2s→4s→8s | Notification retries |
 | `order-failed-retry-0/1/2` | 2s→4s→8s | Notification retries |
 
-All retry topics use exponential backoff: 2s → 4s → 8s (max 16s), with 4 total attempts (1 original + 3 retries).
+All retry topics use exponential backoff with `delay=2000ms`, `multiplier=2.0`, `maxDelay=16000ms`, resulting in 2s→4s→8s delays with 4 total attempts (1 original + 3 retries).
 
 ### Dead Letter Topics (Auto-created by @RetryableTopic)
 
@@ -267,7 +267,7 @@ Each service has its own `application.yml`:
 | order-validation | `spring.application.name` | order-validation |
 | order-notification | `server.port` | 8082 |
 | order-notification | `spring.application.name` | order-notification-service |
-| All | `spring.kafka.bootstrap-servers` | 192.168.100.131:9092,9093,9094 |
+| All | `spring.kafka.bootstrap-servers` | 192.168.100.131:9092,192.168.100.131:9093,192.168.100.131:9094 |
 | order-notification | `mailgun.from` | noreply@kafka-order-system.com |
 
 ## License

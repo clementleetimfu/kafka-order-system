@@ -9,22 +9,21 @@ Root modules:
 - `order-validation`: Kafka consumer for order validation (port 8081)
 - `order-notification`: Kafka consumer for email notifications via Mailgun (port 8082)
 
-Package structure: `io.clementleetimfu.<module>` (e.g., `ordercommon`, `orderapi`, `ordervalidation`)
+Package structure: `io.clementleetimfu.<module>` (e.g., `ordercommon`, `orderapi`, `ordervalidation`, `orderenotification`)
 
 ```
 order-common/src/main/java/
-  ├── constants/     # TopicConstants, RegionConstants, StatusConstants
+  ├── constants/     # TopicConstants, RegionConstants, StatusConstants, GroupConstants
   ├── dto/           # OrderRequestDTO, OrderResponseDTO, OrderItemRequestDTO
-  └── event/         # OrderPlacedEvent, OrderConfirmedEvent, OrderFailedEvent
+  └── event/         # OrderPlacedEvent, OrderConfirmedEvent, OrderFailedEvent, OrderItem
 
 */src/main/java/
   ├── config/        # KafkaProducerConfig, KafkaConsumerConfig, MailgunConfig
   ├── controller/    # REST controllers (order-api only)
-  ├── service/      # Service interfaces and impl/ implementations
+  ├── service/       # Service interfaces and impl/ implementations
   ├── producer/      # Kafka producers
   ├── consumer/      # Kafka consumers
-  ├── interceptor/   # Kafka producer/consumer interceptors
-  └── partitioner/   # Custom Kafka partitioners
+  └── interceptor/   # Kafka producer/consumer interceptors
 ```
 
 ## Build, Test, and Development Commands
@@ -48,12 +47,26 @@ cd order-validation && mvn spring-boot:run     # Validation on port 8081
 cd order-notification && mvn spring-boot:run   # Notification on port 8082
 ```
 
-Requirements: Java 17, Maven 3.6+, Kafka cluster
+Requirements: Java 17, Maven 3.6+, Kafka cluster (3 brokers via Docker Compose)
 
 ## Coding Style & Naming Conventions
 
 ### Imports
-Order: third-party (Lombok, Spring, Hutool), project packages, JDK. No wildcard imports except static constants.
+Order: Lombok, Spring/Hutool, project packages, JDK. No wildcard imports except static constants.
+
+Example:
+```java
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import io.clementleetimfu.ordercommon.constants.TopicConstants;
+import io.clementleetimfu.ordercommon.event.OrderPlacedEvent;
+import java.time.Instant;
+import java.util.List;
+```
 
 ### Class Naming
 - Classes: `PascalCase` (e.g., `OrderProducer`, `RegionPartitioner`)
@@ -61,6 +74,8 @@ Order: third-party (Lombok, Spring, Hutool), project packages, JDK. No wildcard 
 - Events: suffix with `Event` (e.g., `OrderPlacedEvent`)
 - Constants classes: suffix with `Constants` (e.g., `TopicConstants`)
 - Tests: suffix with `Test` (unit tests), `IT` (integration tests)
+- Interfaces: no prefix/suffix (e.g., `OrderService`, `MailgunService`)
+- Implementations: suffix with `Impl` (e.g., `OrderServiceImpl`)
 
 ### Package Naming
 Use singular nouns: `controller`, `service`, `consumer`, `producer`, `config`, `interceptor`, `partitioner`.
@@ -73,33 +88,44 @@ public class OrderPlacedEvent {
     private Instant placedAt;
 }
 ```
-Use `@Slf4j` for logger injection.
+Use `@Slf4j` for logger injection. Group annotations on single line when using multiple.
 
 ### Dependency Injection
 Use `@Autowired` for field injection (current pattern). Constructor injection via `@RequiredArgsConstructor` also acceptable.
 
 ### Constants
-All constants in `order-common`. Use `public static final` with private constructor:
+All constants in `order-common` module. Use `public static final` with private constructor:
 ```java
 public final class TopicConstants {
     public static final String ORDER_PLACED = "order-placed";
+    public static final int PARTITIONS = 3;
     private TopicConstants() {}
 }
 ```
-Never hardcode topic names, status values, or configuration strings.
+Never hardcode topic names, status values, region strings, or configuration strings.
 
 ### Error Handling
 - Use `log.error()` with message and exception for error logging
 - Wrap exceptions with context: `throw new RuntimeException("Order processing failed: " + orderId, e);`
-- Return appropriate HTTP status codes (HttpStatus.ACCEPTED, HttpStatus.INTERNAL_SERVER_ERROR)
+- Return appropriate HTTP status codes (`HttpStatus.ACCEPTED`, `HttpStatus.INTERNAL_SERVER_ERROR`)
+- Always include relevant IDs in log messages
 
 ### Logging
 - Log levels: DEBUG for detailed flow, INFO for key events, ERROR for failures
 - Include relevant IDs: `log.info("Order sent: orderId={}", orderId)`
+- Use parameterized logging, not string concatenation
 
 ### Java 17 Features
-- Switch expressions: `return switch (region) { case "ASIA" -> 0; case "EUROPE" -> 1; default -> 2; };`
-- Pattern matching: `if (value instanceof OrderPlacedEvent event) { return event.getRegion(); }`
+- Switch expressions: `return switch (region) { case RegionConstants.ASIA -> 0; case RegionConstants.EUROPE -> 1; default -> fallbackPartition(keyBytes, numPartitions); };`
+- Pattern matching for `instanceof`:
+```java
+if (value instanceof OrderPlacedEvent event) {
+    return event.getRegion();
+}
+if (orderValidationResult instanceof OrderConfirmedEvent confirmedEvent) {
+    orderId = confirmedEvent.getOrderId();
+}
+```
 
 ### Hutool Library
 Use Hutool utilities for common operations:
@@ -108,31 +134,69 @@ Use Hutool utilities for common operations:
 - `CollectionUtil.isEmpty()` for collection null/empty checks
 
 ### Kafka Patterns
-- **Producers**: Use `CompletableFuture` with `thenAccept`/`exceptionally` callbacks
-- **Consumers**: Manual acknowledgment (`Acknowledgment acknowledgment.acknowledge()`)
-- **Retry**: `@RetryableTopic` with `@Backoff` for exponential backoff
-- **DLT**: `@DltHandler` method for dead letter topic processing
-- **Partitioners**: Implement `Partitioner` interface for custom routing
-- **Interceptors**: Implement `ProducerInterceptor`/`ConsumerInterceptor` for cross-cutting concerns
 
-### Service Implementation Pattern
+#### Producer Pattern
 ```java
-public interface OrderService {
-    ResponseEntity<OrderResponseDTO> placeOrder(OrderRequestDTO dto);
+public CompletableFuture<SendResult<String, OrderPlacedEvent>> sendOrder(OrderPlacedEvent event) {
+    CompletableFuture<SendResult<String, OrderPlacedEvent>> future =
+            kafkaTemplate.send(TopicConstants.ORDER_PLACED, event.getOrderId(), event);
+    attachCallbacks(future, event);
+    return future;
 }
 
-@Slf4j
-@Service
-public class OrderServiceImpl implements OrderService {
-    @Autowired
-    private OrderProducer orderProducer;
-    
-    @Override
-    public ResponseEntity<OrderResponseDTO> placeOrder(OrderRequestDTO dto) {
-        // Implementation
-    }
+private void attachCallbacks(CompletableFuture<...> future, OrderPlacedEvent event) {
+    future.thenAccept(result -> {
+        log.debug("Order sent: topic={}, partition={}, offset={}",
+                result.getRecordMetadata().topic(),
+                result.getRecordMetadata().partition(),
+                result.getRecordMetadata().offset());
+    }).exceptionally(e -> {
+        log.error("Failed to send order {}", event.getOrderId(), e);
+        return null;
+    });
 }
 ```
+
+#### Consumer Pattern
+```java
+@RetryableTopic(
+    attempts = "4",
+    backoff = @Backoff(delay = 2000, multiplier = 2.0, maxDelay = 16000),
+    autoCreateTopics = "true",
+    topicSuffixingStrategy = TopicSuffixingStrategy.SUFFIX_WITH_INDEX_VALUE,
+    dltStrategy = DltStrategy.FAIL_ON_ERROR,
+    include = {Exception.class}
+)
+@KafkaListener(topics = TopicConstants.ORDER_PLACED, groupId = GroupConstants.VALIDATION)
+public void onOrderPlaced(ConsumerRecord<String, OrderPlacedEvent> record, Acknowledgment ack) {
+    // Process message
+    ack.acknowledge();
+}
+
+@DltHandler
+public void handleDlt(ConsumerRecord<String, OrderPlacedEvent> record, Acknowledgment ack) {
+    log.error("DLT event: topic={}, value={}", record.topic(), record.value());
+    ack.acknowledge();
+}
+```
+
+#### Custom Partitioner
+Implement `Partitioner` interface:
+```java
+@Override
+public int partition(String topic, Object key, byte[] keyBytes, Object value, 
+                      byte[] valueBytes, Cluster cluster) {
+    return switch (region) {
+        case RegionConstants.ASIA -> 0;
+        case RegionConstants.EUROPE -> 1;
+        case RegionConstants.AMERICA -> 2;
+        default -> fallbackPartition(keyBytes, numPartitions);
+    };
+}
+```
+
+#### Interceptor Pattern
+ProducerInterceptor adds audit headers; ConsumerInterceptor tracks metrics.
 
 ## Testing Guidelines
 
@@ -140,6 +204,7 @@ Spring Boot test support available (`spring-boot-starter-test`, `spring-kafka-te
 
 - Place tests in `src/test/java` mirroring production packages
 - Use `@SpringBootTest` for integration tests, `@EmbeddedKafka` for Kafka tests
+- No wildcard imports except static constants
 - Run `mvn test` before PRs
 
 ## Commit & Pull Request Guidelines
